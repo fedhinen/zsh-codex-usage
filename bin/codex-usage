@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Show cached Codex rate-limit usage for terminal prompts.
+
+The command talks only to the locally installed Codex CLI. It never reads or
+prints credentials; its cache is private to the current user.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+from pathlib import Path
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from typing import Any, Iterator
+
+
+CACHE_MAX_AGE_SECONDS = 30 * 60
+FAILED_REFRESH_RETRY_SECONDS = 60
+LOGIN_TIMEOUT_SECONDS = 2
+REQUEST_TIMEOUT_SECONDS = 3
+SCHEMA_VERSION = 2
+
+
+def now() -> dt.datetime:
+    return dt.datetime.now().astimezone()
+
+
+def now_iso() -> str:
+    return now().isoformat(timespec="seconds")
+
+
+def cache_paths() -> tuple[Path, Path]:
+    cache_home = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    root = Path(cache_home) / "codex-usage"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root.chmod(0o700)
+    return root / "usage.json", root / "usage.lock"
+
+
+def load_cache(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if data.get("schemaVersion") in (1, SCHEMA_VERSION) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def timestamp(data: dict[str, Any], key: str) -> dt.datetime | None:
+    try:
+        value = dt.datetime.fromisoformat(data[key])
+        return value if value.tzinfo else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def cache_is_fresh(data: dict[str, Any] | None) -> bool:
+    if not data or data.get("stale"):
+        return False
+    refreshed = timestamp(data, "lastSuccessfulRefreshAt") or timestamp(data, "updatedAt")
+    if not refreshed:
+        return False
+    age = (now() - refreshed).total_seconds()
+    return 0 <= age < CACHE_MAX_AGE_SECONDS
+
+
+def retry_is_due(data: dict[str, Any] | None) -> bool:
+    if not data or not data.get("stale"):
+        return True
+    attempted = timestamp(data, "lastAttemptAt")
+    return not attempted or (now() - attempted).total_seconds() >= FAILED_REFRESH_RETRY_SECONDS
+
+
+def save_cache(path: Path, data: dict[str, Any]) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+
+
+def logged_in(codex: str) -> bool:
+    try:
+        return subprocess.run([codex, "login", "status"], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=LOGIN_TIMEOUT_SECONDS, check=False).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def message_stream(process: subprocess.Popen[bytes], deadline: float) -> Iterator[dict[str, Any]]:
+    assert process.stdout is not None
+    buffer = b""
+    while time.monotonic() < deadline:
+        readable, _, _ = select.select([process.stdout], [], [], max(0, deadline - time.monotonic()))
+        if not readable:
+            break
+        chunk = os.read(process.stdout.fileno(), 4096)
+        if not chunk:
+            break
+        buffer += chunk
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            try:
+                yield json.loads(line)
+            except (UnicodeDecodeError, ValueError):
+                continue
+    raise TimeoutError("Codex App Server did not respond in time")
+
+
+def request_rate_limits(codex: str) -> dict[str, Any]:
+    process: subprocess.Popen[bytes] = subprocess.Popen(
+        [codex, "app-server", "--listen", "stdio://"], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0, start_new_session=True)
+    messages = message_stream(process, time.monotonic() + REQUEST_TIMEOUT_SECONDS)
+
+    def send(payload: dict[str, Any]) -> None:
+        assert process.stdin is not None
+        process.stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+        process.stdin.flush()
+
+    try:
+        send({"id": 1, "method": "initialize", "params": {"clientInfo": {
+            "name": "zsh-codex-usage", "title": "Codex usage for Zsh", "version": "1"}, "capabilities": None}})
+        while True:
+            message = next(messages)
+            if message.get("id") == 1:
+                if "error" in message:
+                    raise RuntimeError("Codex App Server initialization failed")
+                break
+        send({"method": "initialized"})
+        send({"id": 2, "method": "account/rateLimits/read", "params": None})
+        while True:
+            message = next(messages)
+            if message.get("id") == 2:
+                if "error" in message:
+                    raise RuntimeError("Codex rate-limit request failed")
+                return message.get("result") or {}
+    finally:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+
+def rate_limit_windows(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    snapshots: list[dict[str, Any]] = []
+    if isinstance(result.get("rateLimits"), dict):
+        snapshots.append(result["rateLimits"])
+    if isinstance(result.get("rateLimitsByLimitId"), dict):
+        snapshots.extend(value for value in result["rateLimitsByLimitId"].values() if isinstance(value, dict))
+    windows: dict[str, dict[str, Any]] = {}
+    for name in ("primary", "secondary"):
+        for snapshot in snapshots:
+            value = snapshot.get(name)
+            if isinstance(value, dict) and isinstance(value.get("usedPercent"), (int, float)):
+                used = max(0, min(100, round(value["usedPercent"])))
+                reset = value.get("resetsAt")
+                reset_iso = (dt.datetime.fromtimestamp(reset, tz=dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+                             if isinstance(reset, (int, float)) else None)
+                windows[name] = {"consumedPercent": used, "remainingPercent": 100 - used,
+                                 "resetsAt": reset_iso, "windowMinutes": value.get("windowDurationMins")}
+                break
+    return windows
+
+
+def fresh_payload(result: dict[str, Any]) -> dict[str, Any]:
+    windows = rate_limit_windows(result)
+    primary = windows.get("primary") or windows.get("secondary")
+    if not primary:
+        raise RuntimeError("Codex did not return a rate-limit window")
+    refreshed = now_iso()
+    return {"schemaVersion": SCHEMA_VERSION, "loggedIn": True, "windows": windows,
+            **primary, "updatedAt": refreshed, "lastSuccessfulRefreshAt": refreshed,
+            "lastAttemptAt": refreshed, "stale": False, "error": None}
+
+
+def error_payload(previous: dict[str, Any] | None, error: str, is_logged_in: bool) -> dict[str, Any]:
+    data = dict(previous or {})
+    data.update({"schemaVersion": SCHEMA_VERSION, "loggedIn": is_logged_in,
+                 "lastAttemptAt": now_iso(), "stale": True, "error": error})
+    if not is_logged_in:
+        data.update({"consumedPercent": None, "remainingPercent": None, "resetsAt": None,
+                     "windowMinutes": None, "windows": {}})
+    return data
+
+
+def usage() -> dict[str, Any]:
+    try:
+        cache_path, lock_path = cache_paths()
+        with lock_path.open("a+", encoding="utf-8") as lock:
+            cached = load_cache(cache_path)
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return cached or error_payload(None, "Codex usage is refreshing", True)
+            if cache_is_fresh(cached) or not retry_is_due(cached):
+                return cached  # type: ignore[return-value]
+            codex = shutil.which("codex")
+            if not codex:
+                data = error_payload(cached, "Codex CLI is not installed", False)
+            elif not logged_in(codex):
+                data = error_payload(cached, "Log in to Codex", False)
+            else:
+                try:
+                    data = fresh_payload(request_rate_limits(codex))
+                except (OSError, RuntimeError, TimeoutError, ValueError):
+                    data = error_payload(cached, "Could not refresh Codex usage", True)
+            try:
+                save_cache(cache_path, data)
+            except OSError:
+                pass
+            return data
+    except OSError:
+        return error_payload(None, "Could not access Codex usage cache", False)
+
+
+def window_text(window: dict[str, Any]) -> str | None:
+    remaining = window.get("remainingPercent")
+    if not isinstance(remaining, int):
+        return None
+    reset_text = ""
+    try:
+        reset_text = " · ↻ " + dt.datetime.fromisoformat(window["resetsAt"]).strftime("%a %H:%M")
+    except (KeyError, TypeError, ValueError):
+        pass
+    return f"{remaining}%{reset_text}"
+
+
+def prompt_text(data: dict[str, Any], window: str) -> str | None:
+    if not data.get("loggedIn"):
+        return None
+    windows = data.get("windows") if isinstance(data.get("windows"), dict) else {}
+    if window == "both":
+        parts = [f"{name[0].upper()}: {window_text(value)}" for name, value in windows.items()
+                 if name in ("primary", "secondary") and isinstance(value, dict) and window_text(value)]
+        text = " · ".join(parts)
+    else:
+        selected = windows.get(window) if windows else data
+        text = window_text(selected) if isinstance(selected, dict) else None
+    if not text:
+        return None
+    stale = " ~" if data.get("stale") else ""
+    return f"󰚩 {text}{stale}"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--format", choices=("starship", "json"), default="starship")
+    parser.add_argument("--window", choices=("primary", "secondary", "both"), default="primary")
+    args = parser.parse_args()
+    data = usage()
+    if args.format == "json":
+        print(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+        return 0
+    text = prompt_text(data, args.window)
+    if text:
+        print(text)
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
